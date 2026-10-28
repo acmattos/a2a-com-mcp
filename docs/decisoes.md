@@ -73,3 +73,47 @@ uv run python servidor-mcp/main.py    # MCP em :7301/mcp (requer REQUEST_STATE_S
 uv run python agente/main.py          # agente A2A em :7300/a2a
 uv run python validador/validar.py --agente http://localhost:7300 --mcp http://localhost:7301
 ```
+
+## Fase 2 — servidor MCP básico
+
+Arquitetura (dependências apontam para dentro; o domínio não conhece o MCP):
+
+```
+main.py ──► protocol.py (adaptador MCP) ──► service.py (casos de uso) ──► domain.py (regras puras)
+   │                                                  └────────────────► repository.py (dados + memória)
+   └──► telemetry.py (middleware ASGI de log em stderr)
+```
+
+- `service.py`: `BookingService` (listar, consultar, reservar). Valida, checa conflito e só então grava.
+  Conflito levanta `BookingConflict`; erro de regra levanta `DomainError`. Sem tipos do MCP.
+- `protocol.py`: traduz o serviço para tools/resource. As tools retornam `Annotated[CallToolResult, Modelo]`:
+  o `outputSchema` vem do modelo e o erro de negócio sai como `CallToolResult(is_error=True)` com a mensagem
+  **literal** (sem o prefixo `Error executing tool ...` que o SDK poria ao levantar `ToolError`).
+  `structuredContent` e o bloco de texto saem do mesmo `model_dump`, logo são o mesmo objeto JSON.
+- `telemetry.py`: middleware ASGI puro. Registra `mcp-request method=... id=... [name=...] traceparent=...`
+  antes de o SDK validar, então requisições rejeitadas (sem `_meta`, header incoerente) também aparecem.
+  Nunca registra argumentos, `requestState` ou corpo. Valores são escapados para não forjar linhas de log.
+- `main.py`: `MCP_HOST` (padrão `127.0.0.1`) e `MCP_PORT` (padrão `7301`), `stateless_http=True`,
+  `json_response=True`. `localhost` resolve e é aceito pela proteção de Host do SDK.
+- O texto do resource é lido com `read_text`, que normaliza para LF. O arquivo do disco está em CRLF só pelo
+  `core.autocrlf=true` do Windows; o blob do Git e o exemplo do starter usam LF.
+
+### Comportamento provisório (substituído na Fase 3)
+
+`reservar_sala` em intervalo ocupado devolve erro de tool `Conflito de horario: a sala ja esta reservada nesse
+intervalo` (`isError=true`) e **não grava nada**. Não há `InputRequiredResult`, elicitation nem `requestState`.
+Por isso os checks 13–20 do validador falham nesta fase, como esperado.
+
+### Limitação do SDK: `MCP-Protocol-Version` legado/ausente contra envelope moderno
+
+- **API:** `mcp.shared.inbound.classify_inbound_request` (a escada de validação) e o roteamento de
+  `mcp.server._streamable_http_modern`, `mcp` 2.3.0.
+- **Evidência (reproduzível):** `tests/test_mcp_http.py::test_legacy_or_absent_version_header_against_a_modern_envelope_is_header_mismatch`
+  (`xfail(strict=True)`). Um `tools/call` com `_meta.protocolVersion = 2026-07-28` e header
+  `MCP-Protocol-Version: 2025-11-25` (ou sem o header) responde 200 em vez de `-32020`.
+- **Causa:** o header escolhe o caminho; versão legada ou ausente vai para o transporte legado, que não roda a
+  escada. Versão desconhecida (`1999-01-01`), `Mcp-Method` e `Mcp-Name` incoerentes já dão `-32020` + HTTP 400.
+- **Alternativas consideradas:** (a) guard próprio no middleware que compare o header com o `_meta` — descartado,
+  é reimplementar parte da validação do protocolo, o que o enunciado proíbe; (b) aceitar e documentar — adotado.
+  O `xfail` estrito avisa quando uma versão futura do SDK corrigir.
+- **Impacto no desafio:** nenhum check automatizado cobre isso; o agente sempre envia header e envelope coerentes.
