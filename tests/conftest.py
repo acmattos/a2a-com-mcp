@@ -1,4 +1,5 @@
 import os
+import secrets
 import socket
 import subprocess
 import sys
@@ -24,7 +25,8 @@ STARTUP_TIMEOUT = 30
 class McpServerProcess:
     """The real MCP server in its own process, reached over real HTTP."""
 
-    def __init__(self, workdir: Path) -> None:
+    def __init__(self, workdir: Path, secret: str | None = None) -> None:
+        self.secret = secret or secrets.token_hex(32)
         self._workdir = workdir
         self._stderr_path = workdir / "stderr.log"
         self._process: subprocess.Popen | None = None
@@ -38,7 +40,8 @@ class McpServerProcess:
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             self.port = probe.getsockname()[1]
-        env = {**os.environ, "MCP_HOST": "127.0.0.1", "MCP_PORT": str(self.port)}
+        env = {**os.environ, "MCP_HOST": "127.0.0.1", "MCP_PORT": str(self.port),
+               "REQUEST_STATE_SECRET": self.secret}
         with open(self._stderr_path, "wb") as stderr:
             # Started from an unrelated cwd on purpose: data paths must not depend on it.
             self._process = subprocess.Popen(

@@ -7,7 +7,6 @@ import pytest
 
 from conftest import (CAPABILITIES_KEY, ELICITATION_FORM, PROTOCOL, ROOT, VERSION_KEY, McpHttpClient,
                       McpServerProcess)
-from protocol import ERR_CONFLICT_PROVISIONAL
 
 DATA = ROOT / "dados"
 
@@ -206,16 +205,14 @@ def test_reservations_persist_for_later_queries_in_the_same_process(fresh_mcp):
 def test_booking_the_same_slot_twice_is_not_possible(fresh_mcp):
     fresh_mcp.tool_result("reservar_sala", booking("sala-aquario", (9,), (10,)))
     again = fresh_mcp.tool_result("reservar_sala", booking("sala-aquario", (9,), (10,), "Outro"))
-    assert again["isError"] is True
+    assert again["resultType"] == "input_required" and "structuredContent" not in again
     conflicts = fresh_mcp.tool_result("consultar_disponibilidade", booking("sala-aquario", (9,), (10,)))
     assert [c["responsavel"] for c in conflicts["structuredContent"]["conflitos"]] == ["Doc"]
 
 
-def test_conflict_with_an_initial_reservation_is_refused_without_creating_anything(fresh_mcp):
-    """Provisional phase-2 behaviour: plain tool error. The multi-round flow replaces it in phase 3."""
+def test_a_conflict_with_a_seed_reservation_asks_and_creates_nothing_until_answered(fresh_mcp):
     result = fresh_mcp.tool_result("reservar_sala", booking("sala-garagem", (14,), (15,), "Biff"))
-    assert result["isError"] is True and text_of(result) == ERR_CONFLICT_PROVISIONAL
-    assert "inputRequests" not in result and "requestState" not in result
+    assert result["resultType"] == "input_required" and result.get("isError") is not True
     conflicts = fresh_mcp.tool_result("consultar_disponibilidade", booking("sala-garagem", (14,), (15,)))
     assert [c["id"] for c in conflicts["structuredContent"]["conflitos"]] == ["res-0001"]
     assert fresh_mcp.tool_result("reservar_sala", booking("sala-porao", (9,), (10,)))["structuredContent"][

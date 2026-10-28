@@ -98,7 +98,7 @@ main.py ──► protocol.py (adaptador MCP) ──► service.py (casos de uso
 - O texto do resource é lido com `read_text`, que normaliza para LF. O arquivo do disco está em CRLF só pelo
   `core.autocrlf=true` do Windows; o blob do Git e o exemplo do starter usam LF.
 
-### Comportamento provisório (substituído na Fase 3)
+### Comportamento provisório (SUBSTITUÍDO na Fase 3; mantido aqui como histórico)
 
 `reservar_sala` em intervalo ocupado devolve erro de tool `Conflito de horario: a sala ja esta reservada nesse
 intervalo` (`isError=true`) e **não grava nada**. Não há `InputRequiredResult`, elicitation nem `requestState`.
@@ -117,3 +117,71 @@ Por isso os checks 13–20 do validador falham nesta fase, como esperado.
   é reimplementar parte da validação do protocolo, o que o enunciado proíbe; (b) aceitar e documentar — adotado.
   O `xfail` estrito avisa quando uma versão futura do SDK corrigir.
 - **Impacto no desafio:** nenhum check automatizado cobre isso; o agente sempre envia header e envelope coerentes.
+
+## Fase 3 — MRTR com `requestState` selado
+
+### Desenho
+
+```
+reservar_sala(sala, inicio, fim, responsavel, escolha=Resolve(escolha_de_sala))
+   escolha_de_sala ─► service.alternatives_for ─► domain.find_alternatives   (regra só no domínio)
+```
+
+- **Resolver oficial do `MCPServer`** (`Resolve`/`Elicit`). O resolver devolve `Elicit` só quando o intervalo está
+  ocupado **e** há alternativas. Nos outros casos (livre, entrada inválida, sem alternativa) devolve `None`: a
+  pergunta não é feita e o corpo da tool responde, com as mensagens literais (`Sem alternativas disponiveis no
+  intervalo` entre elas). O adaptador não calcula nada; só traduz.
+- **Form**: um modelo dinâmico `create_model("EscolhaDeSala", sala=(Literal[ids], ...))` gera `enum` (ou `const`
+  com uma só alternativa, aceito pelo enunciado). Texto: `A sala pedida esta ocupada nesse intervalo. Escolha uma alternativa.`
+- **Consumidor**: `ElicitationResult[Any]` (a união), para distinguir `accept` de `decline`/`cancel`. `decline` e
+  `cancel` retornam `complete`, `reservado=false`, `motivo="recusado"`, sem `isError` e sem gravar.
+- `protocol.py` **não** usa `from __future__ import annotations`: o SDK avalia as anotações e
+  `Resolve(escolha_de_sala)` aponta para um nome local.
+
+### Selo do `requestState` (o que é do SDK e o que é nosso)
+
+| Garantia | Quem entrega | Evidência |
+|---|---|---|
+| Integridade e confidencialidade | SDK: AES-256-GCM, chave derivada por HKDF | token adulterado em 9 formas ⇒ `-32602` |
+| Expiração | SDK: `RequestStateSecurity(ttl=600)` | `tests/test_mrtr_expiry.py`: válido em TTL−5 s, recusado em TTL+5 s |
+| Vínculo com o pedido | SDK: nome da tool + digest dos argumentos | argumento trocado, token de outro pedido, outra tool ⇒ `-32602` |
+| Vínculo com o serviço | SDK: `audience` = nome do servidor | token de outro deployment (outro segredo) ⇒ `-32602` |
+| Resposta vale só para a pergunta vista | SDK: digest da pergunta no estado | se as alternativas mudarem, ele **pergunta de novo** (novo token) |
+| Segredo só do ambiente, ≥ 32 bytes | nós: `config.py` | sem segredo/curto ⇒ o processo nem sobe (exit 2); nunca ecoado |
+| Sem chave efêmera nem sessão | nós: `build_server` exige `RequestStateSecurity` | mutante com chave efêmera derruba o teste de restart |
+
+Política do segredo: valor hexadecimal conta pelos bytes que codifica (`token_hex(32)` = 64 caracteres = 32 bytes;
+32 caracteres hex são só 16 bytes e são recusados); qualquer outro valor conta pelo tamanho em UTF-8. Entropia
+real não é mensurável, então a exigência é de tamanho.
+
+O corpo do `requestState` não é aberto pelo nosso código em nenhum ponto; ele só passa pelo SDK.
+
+### Comportamento observado (resposta real do servidor)
+
+| Entrada | Resposta |
+|---|---|
+| token adulterado / truncado / lixo | `-32602` `Invalid or expired requestState`, HTTP 400 |
+| argumento alterado no retry | `-32602` (vínculo com o pedido) |
+| mesmo token em outra tool | `-32602` |
+| escolha fora do enum, sala original, `accept` sem `content`, `sala` não-string | `complete` + `isError=true` (erro do resolver); nada é gravado |
+| `action` inválida, entrada que não é objeto, `inputResponses` que não é mapa | `-32602 Invalid request parameters`, HTTP 400 |
+| chave errada em `inputResponses`, ou nenhuma resposta | pergunta de novo (`input_required`); nada é gravado |
+| replay de um `accept` já consumido | pergunta de novo, com as alternativas atuais; **sem reserva duplicada** |
+| cliente sem `elicitation.form` e há alternativas | `-32021`, `data.requiredCapabilities`, HTTP 400 |
+| cliente sem `elicitation.form` e não há alternativas | `isError` `Sem alternativas...` (nenhuma pergunta é necessária) |
+
+### Pontos de atenção para as próximas fases
+
+1. **Pergunta que muda entre rodadas.** O estado sela o digest da pergunta. Se outra reserva ocupar uma das
+   alternativas antes da resposta, o retry devolve `input_required` outra vez (novo token e novo enum). O agente
+   (Fases 4 e 6) precisa tratar uma segunda pausa na mesma Task, não assumir que o retry conclui.
+2. **Chave de `inputRequests`** = `protocol:build_server.<locals>.escolha_de_sala`. É determinística, atribuída pelo
+   servidor e estável entre restarts; o agente só a ecoa. Não é formato fixo do enunciado.
+3. **`{"elicitation": {}}`** (sem `form` nem `url`) é tratado pelo SDK como suporte a form (compatibilidade com
+   a forma anterior aos modos). `{}` e `{"elicitation": {"url": {}}}` dão `-32021`.
+4. **Reservas não persistem e o estado selado sim.** Se o conflito era com uma reserva criada em memória e o
+   processo reiniciou, o conflito deixou de existir: a pergunta não é refeita e o retry reserva a sala
+   **originalmente pedida** (agora livre). Com as reservas do starter (`res-0001`/`res-0002`), que são relidas no
+   boot, o fluxo do avaliador (passo 12) conclui na sala escolhida. É consequência direta de "reservas só em memória".
+5. A limitação do SDK sobre o header `MCP-Protocol-Version` (Fase 2) continua válida e inalterada
+   (`xfail(strict=True)`); não é regressão desta fase.

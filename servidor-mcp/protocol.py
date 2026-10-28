@@ -1,24 +1,34 @@
-"""MCP adapter: exposes ``BookingService`` as tools and a resource. No business rules live here."""
+"""MCP adapter: exposes ``BookingService`` as tools and a resource. No business rules live here.
 
-from __future__ import annotations
+No ``from __future__ import annotations`` on purpose: the SDK evaluates the tool annotations, and
+``Resolve(escolha_de_sala)`` refers to a local name that only exists when the annotation is evaluated eagerly.
+"""
 
 import json
-from typing import Annotated
+from typing import Annotated, Any, Literal
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import (
+    AcceptedElicitation,
+    CancelledElicitation,
+    DeclinedElicitation,
+    Elicit,
+    ElicitationResult,
+    MCPServer,
+    RequestStateSecurity,
+    Resolve,
+)
 from mcp_types import CallToolResult, TextContent
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, create_model
 
-from domain import DomainError, Reservation, format_instant
+from domain import ERR_NO_ALTERNATIVES, DomainError, Reservation, format_instant
 from service import BookingConflict, BookingService
 
 SERVER_NAME = "central-de-salas"
 SERVER_VERSION = "1.0.0"
 POLICY_URI = "politica://uso"
 
-# TEMPORARY (phase 2): until the multi-round-trip flow lands in phase 3, a conflicting
-# booking is refused as a plain tool error. It never creates a reservation.
-ERR_CONFLICT_PROVISIONAL = "Conflito de horario: a sala ja esta reservada nesse intervalo"
+ELICITATION_MESSAGE = "A sala pedida esta ocupada nesse intervalo. Escolha uma alternativa."
+DECLINED_REASON = "recusado"
 
 
 class SalaOut(BaseModel):
@@ -76,8 +86,33 @@ def _conflict_out(reservation: Reservation) -> ConflitoOut:
     )
 
 
-def build_server(service: BookingService) -> MCPServer:
-    server = MCPServer(name=SERVER_NAME, version=SERVER_VERSION)
+def _choice_model(room_ids: list[str]) -> type[BaseModel]:
+    """Flat form with one required string property limited to the offered rooms."""
+    return create_model(
+        "EscolhaDeSala", sala=(Literal[tuple(room_ids)], Field(description="Sala alternativa escolhida"))
+    )
+
+
+def _chosen_room(choice: ElicitationResult[Any], requested: str) -> str:
+    """The room to book: the accepted alternative, or the requested one when nothing was asked."""
+    if isinstance(choice, AcceptedElicitation) and choice.data is not None:
+        return choice.data.sala
+    return requested
+
+
+def build_server(service: BookingService, security: RequestStateSecurity) -> MCPServer:
+    """``security`` is mandatory: there is no default, ephemeral or built-in key to fall back on."""
+    server = MCPServer(name=SERVER_NAME, version=SERVER_VERSION, request_state_security=security)
+
+    def escolha_de_sala(sala: str, inicio: str, fim: str) -> Elicit[Any] | None:
+        """Ask only when the interval is taken and alternatives exist. Invalid input is left to the tool body."""
+        try:
+            alternatives = service.alternatives_for(sala, inicio, fim)
+        except DomainError:
+            return None
+        if not alternatives:
+            return None
+        return Elicit(ELICITATION_MESSAGE, _choice_model([room.id for room in alternatives]))
 
     @server.tool(name="listar_salas", description="Lista todas as salas com capacidade e recursos.")
     def listar_salas() -> Annotated[CallToolResult, ListaDeSalas]:
@@ -109,14 +144,21 @@ def build_server(service: BookingService) -> MCPServer:
         description="Reserva uma sala. Se o intervalo estiver ocupado, pergunta qual alternativa usar.",
     )
     def reservar_sala(
-        sala: str, inicio: str, fim: str, responsavel: str
+        sala: str,
+        inicio: str,
+        fim: str,
+        responsavel: str,
+        escolha: Annotated[ElicitationResult[Any], Resolve(escolha_de_sala)],
     ) -> Annotated[CallToolResult, ReservaOut]:
+        if isinstance(escolha, (DeclinedElicitation, CancelledElicitation)):
+            return _success(ReservaOut(reservado=False, motivo=DECLINED_REASON))
         try:
-            reservation = service.reserve(sala, inicio, fim, responsavel)
+            reservation = service.reserve(_chosen_room(escolha, sala), inicio, fim, responsavel)
         except DomainError as error:
             return _failure(str(error))
         except BookingConflict:
-            return _failure(ERR_CONFLICT_PROVISIONAL)
+            # Nothing to offer, or the chosen room was taken meanwhile: either way, no room fits.
+            return _failure(ERR_NO_ALTERNATIVES)
         return _success(
             ReservaOut(
                 reserva=reservation.id,

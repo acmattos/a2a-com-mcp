@@ -75,3 +75,46 @@ def test_reserve_on_conflict_raises_and_registers_nothing(service, repo):
 
 def test_adjacent_booking_is_not_a_conflict(service):
     assert service.reserve("sala-garagem", iso(15), iso(16), "Doc").room == "sala-garagem"
+
+
+# --- alternatives (phase 3) -------------------------------------------------------------------------------
+
+
+def alternative_ids(service, room, start, end) -> list[str]:
+    return [r.id for r in service.alternatives_for(room, start, end)]
+
+
+def test_alternatives_for_a_conflict_follow_the_capacity_then_id_order(service):
+    assert alternative_ids(service, "sala-garagem", iso(14), iso(15)) == ["sala-fusca", "sala-mirante"]
+
+
+def test_no_alternatives_are_offered_when_the_requested_room_is_free(service):
+    assert alternative_ids(service, "sala-aquario", iso(9), iso(10)) == []
+
+
+def test_alternatives_never_include_rooms_that_are_busy_at_that_time(service):
+    service.reserve("sala-fusca", iso(14), iso(15), "Doc")
+    assert alternative_ids(service, "sala-garagem", iso(14), iso(15)) == ["sala-mirante"]
+
+
+def test_alternatives_are_empty_when_every_larger_room_is_busy(service):
+    service.reserve("sala-fusca", iso(14), iso(15), "Doc")
+    service.reserve("sala-mirante", iso(14), iso(15), "Doc")
+    assert alternative_ids(service, "sala-garagem", iso(14), iso(15)) == []
+
+
+def test_the_largest_room_never_has_alternatives(service):
+    service.reserve("sala-mirante", iso(11), iso(12), "Doc")
+    assert alternative_ids(service, "sala-mirante", iso(11), iso(12)) == []
+
+
+def test_alternatives_are_capped_at_three(service):
+    service.reserve("sala-aquario", iso(9), iso(10), "Doc")
+    assert alternative_ids(service, "sala-aquario", iso(9), iso(10)) == ["sala-porao", "sala-fusca", "sala-garagem"]
+
+
+def test_alternatives_apply_the_same_validations_as_booking(service):
+    with pytest.raises(DomainError):
+        service.alternatives_for("sala-delorean", iso(9), iso(10))
+    with pytest.raises(DomainError):
+        service.alternatives_for("sala-aquario", iso(7), iso(8))

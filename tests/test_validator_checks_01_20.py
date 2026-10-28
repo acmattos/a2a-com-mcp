@@ -1,7 +1,7 @@
-"""Runs the ORIGINAL, unmodified validator against a fresh server and asserts checks 01-12.
+"""Runs the ORIGINAL, unmodified validator against a fresh server and asserts checks 01-20 (the MCP half).
 
-The validator also exercises MRTR (13-20, phase 3) and A2A (21-36, later phases), so this module only
-asserts the first twelve. The agent URL points to a closed port: the validator stops at the first A2A call.
+Checks 21-36 need the A2A agent (later phases). The agent URL points to a closed port: the validator
+stops at the first A2A call, after printing every MCP verdict.
 """
 
 import re
@@ -26,6 +26,14 @@ CHECKS = {
     10: "fora da janela devolve isError com a mensagem exata",
     11: "duracao acima de 2h devolve isError com a mensagem exata",
     12: "intervalo invertido devolve isError com a mensagem exata",
+    13: "conflito devolve input_required com inputRequests e requestState",
+    14: "a elicitation e form mode e oferece as alternativas na ordem certa",
+    15: "conflito sem a capability elicitation devolve -32021 e HTTP 400",
+    16: "retry com inputResponses e requestState conclui a reserva",
+    17: "requestState adulterado e rejeitado com -32602",
+    18: "argumentos adulterados no retry nao tomam efeito",
+    19: "recusa conclui sem reservar e sem isError",
+    20: "conflito sem alternativa possivel devolve isError com a mensagem exata",
 }
 
 

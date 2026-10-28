@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from domain import Reservation, Room, find_conflicts, validate_booking
+from domain import Reservation, Room, find_alternatives, find_conflicts, validate_booking
 from repository import Repository
 
 
@@ -42,6 +42,14 @@ class BookingService:
         booking = validate_booking(self._repository.rooms(), room_id, start_text, end_text)
         conflicts = find_conflicts(self._repository.reservations(), booking.room.id, booking.start, booking.end)
         return Availability(booking.room, not conflicts, conflicts)
+
+    def alternatives_for(self, room_id: str, start_text: object, end_text: object) -> list[Room]:
+        """Rooms to offer when the requested interval is taken; empty when it is free or nothing fits."""
+        booking = validate_booking(self._repository.rooms(), room_id, start_text, end_text)
+        reservations = self._repository.reservations()
+        if not find_conflicts(reservations, booking.room.id, booking.start, booking.end):
+            return []
+        return find_alternatives(self._repository.rooms(), reservations, booking.room, booking.start, booking.end)
 
     def reserve(self, room_id: str, start_text: object, end_text: object, owner: str) -> Reservation:
         """Validate, check for conflicts and only then register the reservation."""
