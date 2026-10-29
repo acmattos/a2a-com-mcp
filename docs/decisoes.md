@@ -185,3 +185,79 @@ O corpo do `requestState` não é aberto pelo nosso código em nenhum ponto; ele
    boot, o fluxo do avaliador (passo 12) conclui na sala escolhida. É consequência direta de "reservas só em memória".
 5. A limitação do SDK sobre o header `MCP-Protocol-Version` (Fase 2) continua válida e inalterada
    (`xfail(strict=True)`); não é regressão desta fase.
+
+## Fase 4 — agente como host MCP
+
+### Módulos (`agente/`)
+
+| Módulo | Papel |
+|---|---|
+| `mcp_host.py` | `McpHost`: cliente MCP real (SDK `mcp` 2.3.0) sobre Streamable HTTP. Interface interna: `book()` e `resume()` devolvem `Reserved \| Declined \| ToolFailed \| InputRequired`; falhas viram `McpUnavailable`, `McpProtocolError` ou `ContractError`. |
+| `http_boundary.py` | Dois transportes `httpx2` na fronteira HTTP (ver abaixo). |
+| `tracing.py` | `traceparent` W3C: mantém o trace-id, gera span-id novo por requisição. Funções puras, sem estado global. |
+
+O agente não importa nada de `servidor-mcp/` e não contém sala, horário nem valor de política (dois testes
+estáticos garantem as duas coisas).
+
+### Fluxo de uma reserva
+
+`tools/list` (e confere o que foi descoberto) → `resources/read politica://uso` (extrai `versao:`) → `tools/call`.
+A descoberta é por reserva, e não só no boot, para que as três requisições levem o trace-id da Task. Ela tem efeito:
+sem a tool `reservar_sala`, ou com um argumento obrigatório que o agente não fornece, o host levanta `ContractError`
+e **nenhum** `tools/call` é enviado. O `resume` repete só o `tools/call`.
+
+Se o servidor responde `input_required`, o host devolve `InputRequired` (chave, `inputRequests` e `requestState`
+exatamente como vieram; `choices` lida do `enum`/`const`). Ele nunca responde à elicitation: a chamada é feita com
+`client.session.call_tool(..., allow_input_required=True)`, e o `elicitation_callback` declarado (só para anunciar a
+capability) levanta erro se for invocado (um teste prova que não é). `request_state` fica fora de `repr`/`str`.
+O host só aceita o formato que espera (uma pergunta, `form`, propriedade `sala` com `enum`/`const`); qualquer outro
+formato é `ContractError`, sem adivinhar.
+
+### Achado 1: a capability anunciada pelo SDK não é a do desafio
+
+`mcp` 2.3.0 monta o anúncio em `ClientSession._build_capabilities` e, havendo `elicitation_callback`, sempre emite
+`{"elicitation": {"form": {}, "url": {}}}`. O carimbo de cada requisição (`_make_modern_stamp`) sobrescreve
+`clientCapabilities`, então passar o valor em `meta` não adianta (testado na Fase 0). O enunciado pede exatamente
+`{"elicitation": {"form": {}}}`, e anunciar `url` convidaria elicitações que o agente não trata.
+
+- **API pública usada:** o parâmetro `http_client` de `streamable_http_client`.
+- **Solução:** `FormOnlyElicitationTransport` envolve o transporte real e remove só a chave `elicitation.url` do
+  corpo; o resto da mensagem (inclusive o `requestState`) segue intacto. Se nada muda, a mensagem passa idêntica.
+- **Evidência no wire:** `tests/test_http_boundary.py` (transporte isolado) e
+  `test_every_request_carries_complete_meta_and_coherent_mirrored_headers` (todas as requisições, vistas no último
+  salto antes do socket, anunciam `{"elicitation":{"form":{}}}`). Sem o adaptador o mesmo teste falha.
+- **Descartado:** subclassear `Client`/`ClientSession` (API privada) e aceitar `{form, url}` (anuncia um modo que não
+  tratamos).
+
+### Achado 2: uma falha de conexão mata o cliente do SDK
+
+Com o servidor fora do ar, a falha sobe como `ExceptionGroup(ConnectError)` e o `Client` fica inutilizável para sempre
+(toda chamada seguinte dá `CancelledError`, mesmo com o servidor de volta). A alternativa óbvia, um `Client` novo por
+operação, reinicia o contador de ids JSON-RPC (`JSONRPCDispatcher._next_id`, sem API pública para alterá-lo) e o retry
+poderia reutilizar o id de uma chamada anterior, o que o enunciado proíbe.
+
+- **Solução:** `UnreachableAsErrorTransport` transforma `httpx2.TransportError` em uma resposta HTTP 503 com erro
+  JSON-RPC (`-32000`, `data.origin = "agent-http-boundary"`, `data.reason = <classe da exceção>`). A requisição falha
+  sozinha, o `Client` sobrevive e um único cliente longevo mantém os ids únicos. O host converte o erro em
+  `McpUnavailable` (sem URL nem detalhes internos).
+- **Evidência:** `test_the_same_host_recovers_by_itself_when_the_server_comes_back` (queda e volta do processo real,
+  ids únicos durante a falha) e `test_every_jsonrpc_id_on_the_wire_is_unique_across_the_whole_session`.
+- **Custo:** a conexão do `McpHost` precisa de ciclo de vida (`async with`); na Fase 5 entra no `lifespan` do ASGI.
+
+### Demonstração
+
+`uv run python scripts/demo_mcp_host.py` percorre reserva livre, sala inexistente, pausa + retomada e pausa +
+recusa. No stderr do servidor: `tools/list` antes do primeiro `tools/call`, ids 1..N únicos e crescentes, a chamada
+pausada e o retry com ids diferentes, o mesmo trace-id em todas as linhas e um span novo em cada uma.
+
+### Pontos de atenção para as próximas fases
+
+1. **Colisão de nomes de módulo nos testes.** `tests/conftest.py` põe `servidor-mcp/` e `agente/` no `sys.path`. Na
+   Fase 5, `agente/main.py` colidiria com `servidor-mcp/main.py` (`import main`). Os testes do agente devem carregar
+   o app por caminho (`importlib`) ou o módulo deve ter outro nome.
+2. **`InputRequired.policy_version`** guarda a versão lida na reserva inicial; o `resume` não relê o resource. A
+   Fase 6 pode guardá-la no registro privado da Task junto com o `InputRequired`.
+3. **Segunda pausa.** `resume()` também pode devolver `InputRequired` (pergunta que mudou, ver Fase 3). A ponte deve
+   tratá-lo como uma nova pausa da mesma Task.
+4. **Sem `cancel`.** O host só expõe `accept` e `decline`; é tudo que o A2A (`escolha=recusar`) precisa.
+5. O `terminate_on_close` é desligado: o transporte é stateless e não há sessão a encerrar.

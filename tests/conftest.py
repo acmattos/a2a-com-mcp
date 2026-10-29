@@ -13,7 +13,9 @@ ROOT = Path(__file__).resolve().parent.parent
 MCP_MAIN = ROOT / "servidor-mcp" / "main.py"
 
 # "servidor-mcp" has a hyphen, so it is not importable as a package: expose it as a source root.
+# The agent's modules get their own root. Module names must stay distinct between the two roots.
 sys.path.insert(0, str(ROOT / "servidor-mcp"))
+sys.path.insert(0, str(ROOT / "agente"))
 
 PROTOCOL = "2026-07-28"
 VERSION_KEY = "io.modelcontextprotocol/protocolVersion"
@@ -25,8 +27,9 @@ STARTUP_TIMEOUT = 30
 class McpServerProcess:
     """The real MCP server in its own process, reached over real HTTP."""
 
-    def __init__(self, workdir: Path, secret: str | None = None) -> None:
+    def __init__(self, workdir: Path, secret: str | None = None, port: int | None = None) -> None:
         self.secret = secret or secrets.token_hex(32)
+        self._fixed_port = port
         self._workdir = workdir
         self._stderr_path = workdir / "stderr.log"
         self._process: subprocess.Popen | None = None
@@ -37,9 +40,12 @@ class McpServerProcess:
         return f"http://127.0.0.1:{self.port}"
 
     def start(self) -> "McpServerProcess":
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            self.port = probe.getsockname()[1]
+        if self._fixed_port:
+            self.port = self._fixed_port
+        else:
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                self.port = probe.getsockname()[1]
         env = {**os.environ, "MCP_HOST": "127.0.0.1", "MCP_PORT": str(self.port),
                "REQUEST_STATE_SECRET": self.secret}
         with open(self._stderr_path, "wb") as stderr:
