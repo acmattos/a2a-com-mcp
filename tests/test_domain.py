@@ -14,6 +14,7 @@ from domain import (
     find_alternatives,
     find_conflicts,
     format_instant,
+    possible_offers,
     validate_booking,
 )
 
@@ -265,3 +266,31 @@ def test_alternative_order_does_not_depend_on_input_order():
 def test_alternatives_are_deterministic_across_calls():
     first = alternatives("sala-garagem", at(14), at(15))
     assert all(alternatives("sala-garagem", at(14), at(15)) == first for _ in range(5))
+
+
+# --- possible offers ---------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("requested", [r.id for r in ROOMS])
+def test_whatever_is_offered_for_any_occupation_is_among_the_possible_offers(requested):
+    """Identifying the question asked earlier relies on this: no real offer may be missing from the enumeration."""
+    from itertools import combinations
+
+    room = next(r for r in ROOMS if r.id == requested)
+    others = [r for r in ROOMS if r.id != requested]
+    possible = [[r.id for r in offer] for offer in possible_offers(ROOMS, room)]
+    for size in range(len(others) + 1):
+        for busy in combinations(others, size):
+            reservations = [booking(r.id, at(14), at(15), "x") for r in busy]
+            offered = alternatives(requested, at(14), at(15), reservations=reservations + [booking(requested, at(14), at(15), "y")])
+            if offered:
+                assert offered in possible
+
+
+def test_possible_offers_are_ordered_capped_and_never_include_smaller_or_the_requested_room():
+    garagem = next(r for r in ROOMS if r.id == "sala-garagem")
+    offers = [[r.id for r in offer] for offer in possible_offers(ROOMS, garagem)]
+    assert offers == [["sala-fusca"], ["sala-mirante"], ["sala-fusca", "sala-mirante"]]
+    porao = next(r for r in ROOMS if r.id == "sala-porao")
+    assert all(len(offer) <= 3 for offer in possible_offers(ROOMS, porao))
+    assert ["sala-fusca", "sala-garagem", "sala-mirante"] in [[r.id for r in o] for o in possible_offers(ROOMS, porao)]

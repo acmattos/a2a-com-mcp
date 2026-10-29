@@ -4,10 +4,12 @@ import json
 import re
 import secrets
 import threading
+from datetime import date
 
 import pytest
 
 from a2a_helpers import A2aClient, booking_text, new_day, state_of, task_of, text_of
+from conftest import AgentProcess, McpServerProcess
 
 POLICY = "2026-11-01"
 WAIT = "alternativas: sala-fusca, sala-mirante"
@@ -259,3 +261,26 @@ def test_no_a2a_response_and_no_agent_log_carries_a_request_state(stack):
     assert not re.search(r"[A-Za-z0-9_\-]{60,}", joined), "a long opaque string reached the A2A client"
     assert stack.mcp_server.secret not in joined
     assert "requestState" not in stack.agent.stderr_text() and not re.search(r"[A-Za-z0-9_\-]{60,}", stack.agent.stderr_text())
+
+
+def test_a_paused_task_resumes_after_the_mcp_server_restarts_and_forgets_its_bookings(tmp_path_factory):
+    """Evaluator step 12 seen from A2A: the pause lives in the agent, the sealed state survives the MCP restart,
+    and the booking that vanished with the lost memory (it shaped the offered list) does not matter."""
+    seed_day = date(2026, 11, 3)
+    mcp = McpServerProcess(tmp_path_factory.mktemp("mcp-before")).start()
+    agent = AgentProcess(tmp_path_factory.mktemp("agent-restart"), mcp.url + "/mcp").start()
+    try:
+        client = A2aClient(agent.url + "/a2a")
+        assert state_of(client.send(booking_text("sala-mirante", seed_day, 14, 15, "Ocupante"))) == "TASK_STATE_COMPLETED"
+        paused = task_of(client.send(booking_text("sala-garagem", seed_day, 14, 15, "Marty")))
+        assert paused["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+        assert text_of(paused["status"]["message"]) == "alternativas: sala-fusca"
+        mcp.stop()
+        mcp = McpServerProcess(tmp_path_factory.mktemp("mcp-after"), secret=mcp.secret, port=mcp.port).start()
+        done = task_of(client.send("escolha=sala-fusca", task_id=paused["id"]))
+        assert done["status"]["state"] == "TASK_STATE_COMPLETED"
+        booking = json.loads(text_of(done["artifacts"][0]))
+        assert (booking["sala"], booking["responsavel"], booking["politica"]) == ("sala-fusca", "Marty", POLICY)
+    finally:
+        agent.stop()
+        mcp.stop()

@@ -183,6 +183,8 @@ O corpo do `requestState` não é aberto pelo nosso código em nenhum ponto; ele
    processo reiniciou, o conflito deixou de existir: a pergunta não é refeita e o retry reserva a sala
    **originalmente pedida** (agora livre). Com as reservas do starter (`res-0001`/`res-0002`), que são relidas no
    boot, o fluxo do avaliador (passo 12) conclui na sala escolhida. É consequência direta de "reservas só em memória".
+   **Corrigido na Fase 7 (ver abaixo):** esta análise ignorava que o passo 8 já reservou a mirante antes do passo 12;
+   nessa sequência real a lista oferecida muda com o restart e o SDK refazia a pergunta em vez de concluir.
 5. A limitação do SDK sobre o header `MCP-Protocol-Version` (Fase 2) continua válida e inalterada
    (`xfail(strict=True)`); não é regressão desta fase.
 
@@ -406,3 +408,95 @@ ela some em COMPLETED/CANCELED/FAILED e é substituída numa segunda pausa.
   retry tardio vira `FAILED`).
 - Uma queda do servidor MCP durante o retry cancela a oportunidade de escolher de novo (ver decisão 6).
 - `cancel` (CancelTask) continua não suportado; a skill não o anuncia.
+
+## Fase 7 — conformidade completa e revisão de fronteiras
+
+### Defeito encontrado e corrigido: passo 12 do avaliador após o passo 8
+
+- **Sintoma (reproduzido em processos reais):** sequência do avaliador — passos 7 e 8 reservam a `sala-mirante` no
+  slot da garagem; o passo 11 obtém um `requestState` cuja pergunta oferece só `sala-fusca`; o passo 12 reinicia o MCP
+  (a reserva da mirante some com a memória) e reenvia o retry. A resposta era `input_required` outra vez, não a reserva.
+  Log do servidor: `Discarding the answer for resolver ...: the question changed since it was asked`.
+- **Causa:** o SDK guarda no selo o *digest* da pergunta e só honra uma resposta para a pergunta renderizada
+  igual. A lista de alternativas vem da memória do servidor, que o restart zera, então a pergunta cresceu para
+  `[sala-fusca, sala-mirante]`. A Fase 3 já previa "pergunta que muda" mas só analisou o caso das reservas do starter.
+- **Primeira correção (insuficiente):** `_standing_answer` aceitava a escolha se a sala estivesse entre as alternativas
+  *de agora*. Isso resolvia o passo 12, mas a auditoria independente reproduziu três defeitos (abaixo), dois deles
+  herdados de antes (o resolver só perguntava com conflito vivo) e um criado por essa própria correção.
+
+#### Gate 7, rodada 2: três defeitos após o restart
+
+| # | Cenário (servidor reiniciado com o mesmo segredo, reservas em memória perdidas) | Antes | Depois |
+|---|---|---|---|
+| 1 | retry com `decline` ou `cancel`, conflito original já inexistente | reservava a sala original | `complete`, `reservado=false`, nada reservado |
+| 2 | retry aceitando `sala-fusca` (ou `sala-mirante`), conflito já inexistente | reservava a `sala-garagem` | reserva exatamente na sala escolhida |
+| 3 | retry aceitando `sala-mirante`, que **não** estava no enum original (`[sala-fusca]`) | aceita (conflito vivo: pela 1ª correção; sem conflito: reservava a original) | rejeitada (`isError`) ou nova pergunta; nada reservado |
+
+- **Causa raiz.** (a) `escolha_de_sala` devolvia `None` assim que não havia alternativas hoje, antes de olhar a
+  resposta: sem pergunta, o corpo da tool reservava a sala pedida e a recusa/escolha era ignorada (defeitos 1 e 2).
+  (b) A validação da escolha usava a lista *atual*, não a que o cliente viu (defeito 3). O SDK sabe o que foi
+  perguntado: `ctx.request_state` chega já autenticado (AES-GCM, TTL, vínculo com tool e argumentos) e contém o
+  `asked`, a chave de `inputRequests` e o digest SHA-256 da pergunta renderizada. Mas só o usa para descartar a
+  resposta quando a pergunta muda; não expõe a lista.
+- **Solução (`servidor-mcp/protocol.py`).** `_standing_answer` recupera a oferta original sem guardar nada no servidor:
+  `domain.possible_offers` enumera todas as listas que `find_alternatives` pode devolver para aquele pedido (as
+  combinações ordenadas de 1 a 3 salas elegíveis, no máximo 14); a que, renderizada pelo mesmo caminho do SDK, tem o
+  digest igual ao selado é a oferta original. Regras, na ordem em que o resolver as aplica:
+  1. a chave e o digest vêm do selo, nunca do cliente; resposta sob outra chave não conta;
+  2. `decline`/`cancel` valem sempre e nada é reservado, exista ou não conflito hoje;
+  3. `accept` vale só se a sala estava na oferta original; não ser oferecida não a torna aceitável por estar livre;
+  4. oferecida e ainda entre as alternativas de hoje, ou sem alternativas a perguntar: é reservada exatamente essa sala
+     (o serviço revalida sala, política e conflito, então sala tomada no meio-tempo nunca gera sobreposição: sem
+     alternativas, `Sem alternativas disponiveis no intervalo`);
+  5. oferecida mas tomada, com alternativas novas: o SDK pergunta de novo (comportamento da Fase 3 preservado);
+  6. não oferecida (ou digest ilegível): com alternativas hoje, o SDK pergunta de novo; sem alternativas, a tool
+     responde `isError` com `Escolha invalida: a sala nao esta entre as alternativas oferecidas`, em vez de reservar
+     a sala original em silêncio.
+  Sem pergunta anterior e sem resposta o comportamento é o de antes (conflito desfeito: reserva a sala pedida).
+- **Contorno e seu custo.** `_decode_state`, `_render_request` e `_request_digest` são funções privadas de
+  `mcp.server.mcpserver.resolve` (mcp 2.3.0, versão travada). Alternativas avaliadas: (i) aceitar só o que o SDK aceita,
+  que reabre o passo 12; (ii) guardar a oferta no servidor, que viola "sem sessão"; (iii) pedir ao cliente que
+  reenvie a lista, que seria entrada controlada por atacante. Se uma versão futura mudar esses nomes, o import falha
+  na subida e os testes de restart ficam vermelhos; se mudar só o formato, `_standing_answer` devolve `None` e vale o
+  comportamento do SDK, nunca uma reserva errada. Não se reimplementa criptografia, selo, TTL nem o vínculo com argumentos.
+- **Regressões (todas com dois processos reais e restart):**
+  `test_a_refusal_after_a_restart_books_nothing_even_though_the_conflict_vanished[decline|cancel]` (defeito 1),
+  `test_an_accepted_alternative_after_a_restart_is_booked_even_though_the_conflict_vanished[sala-fusca|sala-mirante]`
+  (defeito 2), `test_a_room_that_was_never_offered_is_not_accepted_after_a_restart[conflict-vanished|conflict-remains]`
+  (defeito 3), `test_an_offered_room_taken_in_the_meantime_is_never_double_booked_after_a_restart`, mais as da primeira
+  rodada (passo 12 em `test_the_token_survives_a_restart_even_when_the_lost_memory_changes_the_offered_rooms`, o
+  equivalente A2A e a recusa) e `tests/test_domain.py::test_whatever_is_offered_for_any_occupation_is_among_the_possible_offers`.
+  Todos os de defeito ficam vermelhos no código anterior (ver relatório de execução).
+
+### Limitação do SDK reavaliada: `MCP-Protocol-Version` legado ou ausente
+
+Reproduzida de novo contra o servidor real (corpo do exemplo 03, mesmo `_meta` moderno):
+
+| Header `MCP-Protocol-Version` | Resultado |
+|---|---|
+| `2026-07-28` (coerente) | `input_required` |
+| `2025-11-25`, `2025-06-18` ou ausente | HTTP 200, **sem** `-32020`; vai pelo transporte legado: conflito responde `-32600 ... has no back-channel for server-initiated requests` |
+| `1999-01-01` | `-32020`, HTTP 400 |
+
+- **Impacto:** nenhum caminho de reserva fica inseguro (o serviço valida tudo e o MRTR não é atravessado: no legado a
+  pergunta nem é feita). Um cliente que mande envelope moderno com header legado/ausente não recebe `-32020`, e o
+  header legado dispensa `_meta`. O agente sempre envia header e envelope coerentes; o validador (36/36) idem.
+- **Status:** **não resolvido**, permanece `xfail(strict=True)` (`tests/test_mcp_http.py`); decisão de não reimplementar a
+  escada de validação mantida.
+
+### Verificação da Fase 7 (ambiente fresco, `uv run --frozen`)
+
+| Item | Resultado |
+|---|---|
+| `pytest` completo | 462 passed, 2 xfailed (as duas são a limitação do `MCP-Protocol-Version`) |
+| Validador original contra os dois processos recém-iniciados | 36 PASS, 0 FAIL, exit 0; stderr do validador e do agente vazios |
+| Fluxo do avaliador, passos 3 e 7–13 | OK na ordem do avaliador (processos reiniciados antes do passo 7, como o README do validador exige); passo 12 com restart real do MCP |
+| `-32020` por header espelhado divergente | `Mcp-Name`, `Mcp-Method` e versão desconhecida: `-32020`, HTTP 400 |
+| Rastreio | `tools/list` (id 1) antes do primeiro `tools/call` (id 3) do agente; trace-id do validador em todas as chamadas MCP do agente; pausa/retry com ids 6 e 7 |
+| Duas Tasks pausadas, segunda pausa, recusa, Task terminal | OK; terminal responde `-32004` e o estado não muda; escolha tomada por outra Task gera nova pausa na mesma Task |
+| MCP fora do ar | Task `FAILED` com `Servidor de salas indisponivel. Tente novamente.`; sem URL nem detalhes; recupera ao religar |
+| Segredo e `requestState` | segredo ausente de stderr/stdout dos dois processos e do repositório; nenhuma resposta A2A carrega `requestState`/`inputRequests` |
+| Sem LLM, sem regra de negócio no agente | nenhum pacote/import de provedor de LLM; o agente não importa `domain`/`service`/`repository` |
+| `dados/`, `exemplos/`, `validador/` | idênticos ao commit inicial `263f17e` |
+
+Análise estática: o projeto não configura linter nem verificador de tipos; não foi introduzido nenhum.

@@ -1,5 +1,6 @@
 """Phase 3: multi-round-trip flow, sealed requestState and its attack surface. Real server, real HTTP."""
 
+import contextlib
 import itertools
 import json
 
@@ -290,6 +291,15 @@ def test_malformed_input_responses_container_is_handled_without_a_server_failure
     assert is_free(mcp, "sala-fusca", day) and is_free(mcp, "sala-mirante", day)
 
 
+def test_an_answer_without_a_request_state_is_not_honoured_and_asks_again(mcp, days):
+    day = next(days)
+    pending = conflict(mcp, day)
+    status, body, _ = mcp.call("tools/call", {
+        "name": "reservar_sala", "arguments": pending.arguments, "inputResponses": {pending.key: accept("sala-fusca")}})
+    assert status == 200 and body["result"]["resultType"] == "input_required"
+    assert is_free(mcp, "sala-fusca", day) and is_free(mcp, "sala-mirante", day)
+
+
 def test_a_missing_answer_with_a_valid_state_asks_again(mcp, days):
     day = next(days)
     pending = conflict(mcp, day)
@@ -369,6 +379,117 @@ def test_the_token_survives_a_real_process_restart_with_the_same_secret(tmp_path
         assert result["structuredContent"]["reserva"] == "res-0003"
     finally:
         second.stop()
+
+
+def test_the_token_survives_a_restart_even_when_the_lost_memory_changes_the_offered_rooms(tmp_path_factory):
+    """Evaluator step 12 comes after step 8 booked a room: that booking dies with the process and the question grows."""
+    first = McpServerProcess(tmp_path_factory.mktemp("before")).start()
+    try:
+        client = McpHttpClient(first.url)
+        occupy(client, "sala-mirante", 3)
+        pending = ask(client)
+        assert pending.choices == ["sala-fusca"]
+    finally:
+        first.stop()
+    second = McpServerProcess(tmp_path_factory.mktemp("after"), secret=first.secret).start()
+    try:
+        client = McpHttpClient(second.url)
+        assert ask(client).choices == ["sala-fusca", "sala-mirante"]
+        result = respond(client, pending, accept("sala-fusca"))["result"]
+        assert result["resultType"] == "complete" and result["isError"] is False
+        assert result["structuredContent"]["sala"] == "sala-fusca"
+        assert result["structuredContent"]["responsavel"] == "Marty"
+    finally:
+        second.stop()
+
+
+def test_a_refusal_survives_a_restart_even_when_the_lost_memory_changes_the_offered_rooms(tmp_path_factory):
+    first = McpServerProcess(tmp_path_factory.mktemp("before")).start()
+    try:
+        client = McpHttpClient(first.url)
+        occupy(client, "sala-mirante", 3)
+        pending = ask(client)
+    finally:
+        first.stop()
+    second = McpServerProcess(tmp_path_factory.mktemp("after"), secret=first.secret).start()
+    try:
+        client = McpHttpClient(second.url)
+        result = respond(client, pending, {"action": "decline"})["result"]
+        assert result["resultType"] == "complete" and not result.get("isError")
+        assert result["structuredContent"]["reservado"] is False
+        assert result["structuredContent"]["reserva"] is None
+        assert is_free(client, "sala-fusca", 3) and is_free(client, "sala-mirante", 3)
+    finally:
+        second.stop()
+
+
+# --- the answer is bound to the question that was asked, also across a restart -------------------------------------------
+
+
+@contextlib.contextmanager
+def restarted_after_asking(tmp_path_factory, day, occupied):
+    """Ask on a first server (``occupied`` rooms booked in memory first), restart it with the same secret, yield both."""
+    first = McpServerProcess(tmp_path_factory.mktemp("before")).start()
+    try:
+        client = McpHttpClient(first.url)
+        for room in occupied:
+            occupy(client, room, day)
+        pending = ask(client, day=day)
+    finally:
+        first.stop()
+    second = McpServerProcess(tmp_path_factory.mktemp("after"), secret=first.secret).start()
+    try:
+        yield pending, McpHttpClient(second.url)
+    finally:
+        second.stop()
+
+
+def assert_nothing_booked(client, day):
+    for room in ("sala-garagem", "sala-fusca", "sala-mirante"):
+        if not (room == "sala-garagem" and day == 3):  # the starter's reservation keeps the garagem busy on day 3
+            assert is_free(client, room, day), room
+
+
+@pytest.mark.parametrize("action", ["decline", "cancel"])
+def test_a_refusal_after_a_restart_books_nothing_even_though_the_conflict_vanished(tmp_path_factory, action):
+    with restarted_after_asking(tmp_path_factory, 10, ["sala-garagem"]) as (pending, client):
+        assert is_free(client, "sala-garagem", 10)  # the conflict is gone with the lost memory
+        result = respond(client, pending, {"action": action})["result"]
+        assert result["resultType"] == "complete" and not result.get("isError")
+        assert result["structuredContent"]["reservado"] is False and result["structuredContent"]["reserva"] is None
+        assert_nothing_booked(client, 10)
+
+
+@pytest.mark.parametrize("chosen", ["sala-fusca", "sala-mirante"])
+def test_an_accepted_alternative_after_a_restart_is_booked_even_though_the_conflict_vanished(tmp_path_factory, chosen):
+    with restarted_after_asking(tmp_path_factory, 4, ["sala-garagem"]) as (pending, client):
+        assert pending.choices == ["sala-fusca", "sala-mirante"]
+        result = respond(client, pending, accept(chosen))["result"]
+        assert result["resultType"] == "complete" and result["isError"] is False
+        assert result["structuredContent"]["sala"] == chosen
+        assert holders(client, "sala-garagem", 4) == []
+        assert holders(client, chosen, 4) == ["Marty"]
+
+
+@pytest.mark.parametrize("day, occupied", [(4, ["sala-garagem", "sala-mirante"]), (3, ["sala-mirante"])],
+                         ids=["conflict-vanished", "conflict-remains"])
+def test_a_room_that_was_never_offered_is_not_accepted_after_a_restart(tmp_path_factory, day, occupied):
+    with restarted_after_asking(tmp_path_factory, day, occupied) as (pending, client):
+        assert pending.choices == ["sala-fusca"]
+        assert is_free(client, "sala-mirante", day)  # free now, but it was not on the table
+        body = respond(client, pending, accept("sala-mirante"))
+        result = body.get("result", {})
+        assert "error" in body or result.get("isError") is True or result.get("resultType") == "input_required", body
+        assert is_free(client, "sala-mirante", day) and is_free(client, "sala-fusca", day)
+
+
+def test_an_offered_room_taken_in_the_meantime_is_never_double_booked_after_a_restart(tmp_path_factory):
+    with restarted_after_asking(tmp_path_factory, 4, ["sala-garagem"]) as (pending, client):
+        occupy(client, "sala-fusca", 4)
+        body = respond(client, pending, accept("sala-fusca"))
+        result = body.get("result", {})
+        assert "error" in body or result.get("isError") is True or result.get("resultType") == "input_required", body
+        assert holders(client, "sala-fusca", 4) == ["Ocupante"]
 
 
 def test_a_restart_with_a_different_secret_rejects_the_old_token(tmp_path_factory):

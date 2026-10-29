@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from domain import Reservation, Room, find_alternatives, find_conflicts, validate_booking
+from domain import Reservation, Room, find_alternatives, find_conflicts, possible_offers, validate_booking
 from repository import Repository
 
 
@@ -50,6 +50,11 @@ class BookingService:
         if not find_conflicts(reservations, booking.room.id, booking.start, booking.end):
             return []
         return find_alternatives(self._repository.rooms(), reservations, booking.room, booking.start, booking.end)
+
+    def possible_offers(self, room_id: str, start_text: object, end_text: object) -> list[list[Room]]:
+        """Every list of alternatives that could have been offered for this request, whatever the reservations were."""
+        booking = validate_booking(self._repository.rooms(), room_id, start_text, end_text)
+        return possible_offers(self._repository.rooms(), booking.room)
 
     def reserve(self, room_id: str, start_text: object, end_text: object, owner: str) -> Reservation:
         """Validate, check for conflicts and only then register the reservation."""

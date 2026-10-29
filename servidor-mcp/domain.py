@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 from datetime import datetime, time, timedelta, timezone
 
 # Error messages are part of the contract (exact text, Portuguese, no accents).
@@ -115,3 +116,13 @@ def find_alternatives(
         and not find_conflicts(reservations, r.id, start, end)
     ]
     return sorted(candidates, key=lambda r: (r.capacity, r.id))[:MAX_ALTERNATIVES]
+
+
+def possible_offers(rooms: list[Room], requested: Room) -> list[list[Room]]:
+    """Every list ``find_alternatives`` could return for ``requested`` under some set of reservations.
+
+    Used to tell, from the digest of a question asked earlier, which rooms were actually offered.
+    """
+    eligible = sorted((r for r in rooms if r.id != requested.id and r.capacity >= requested.capacity),
+                      key=lambda r: (r.capacity, r.id))
+    return [list(offer) for size in range(1, MAX_ALTERNATIVES + 1) for offer in combinations(eligible, size)]
