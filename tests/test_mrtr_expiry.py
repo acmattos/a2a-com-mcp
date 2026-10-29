@@ -16,7 +16,7 @@ from mcp.server import request_state
 
 from config import REQUEST_STATE_TTL_SECONDS
 from conftest import McpHttpClient
-from main import create_app
+from server_app import create_app
 from mrtr_helpers import accept, ask, is_free, respond
 
 

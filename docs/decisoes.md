@@ -261,3 +261,148 @@ pausada e o retry com ids diferentes, o mesmo trace-id em todas as linhas e um s
    tratá-lo como uma nova pausa da mesma Task.
 4. **Sem `cancel`.** O host só expõe `accept` e `decline`; é tudo que o A2A (`escolha=recusar`) precisa.
 5. O `terminate_on_close` é desligado: o transporte é stateless e não há sessão a encerrar.
+
+## Fase 5 — Servidor A2A v1.0 e ciclo básico de Task
+
+### Módulos (`agente/`)
+
+| Módulo | Papel |
+|---|---|
+| `main.py` | Composição: `create_app(mcp_url, public_url, host_factory)`, `lifespan`, rotas do SDK, `python agente/main.py` na 7300 |
+| `executor.py` | `RoomBookingExecutor(AgentExecutor)`: parser → `McpHost` → estados da Task |
+| `command.py` | Parser determinístico de `reservar sala=… inicio=… fim=… responsavel=…` |
+| `card.py` | Agent Card (modelos protobuf do SDK, serializados em ProtoJSON pela rota do SDK) |
+| `ids.py` | Ids legíveis `task-`/`ctx-`/`msg-`/`art-` + 12 hex |
+
+Nada do servidor MCP é importado (guarda estática da Fase 4 continua valendo) e nenhuma regra de sala/política vive no agente.
+
+### Máquina de estados (nova Task)
+
+```
+Task(SUBMITTED) ─► WORKING ─┬─► COMPLETED  (reserva feita; artifact "reserva")
+                            ├─► FAILED     (isError da tool; servidor indisponível; resposta inesperada)
+                            └─► REJECTED   (texto que não é o comando)
+```
+
+- O evento `Task` sai primeiro; só depois os `TaskStatusUpdateEvent`/artifact (o SDK recusa o contrário).
+- Terminal é definitivo: o SDK recusa `SendMessage` com `taskId` terminal (`-32004`), desconhecido (`-32001`) ou
+  `contextId` divergente (`-32602`). O que faltava: `TaskAwareContextBuilder` recusa `taskId` de Task ainda
+  `SUBMITTED`/`WORKING` (`-32004`, "em andamento"); só uma Task pausada (Fase 6) poderá receber continuação.
+- Comando inválido = `REJECTED` com texto estável (`Comando invalido: <motivo>. Formato: …`), não erro JSON-RPC: a Task existe,
+  tem histórico e `GetTask` a encontra. FAILED fica para falha de execução.
+
+### Decisões
+
+1. **`A2A-Version` ausente = 1.0.** O SDK trata header ausente como 0.3 e recusaria o validador (que não envia o
+   header). `V1CallContextBuilder` aplica `setdefault("a2a-version", "1.0")`; um `A2A-Version: 0.3` explícito continua
+   recusado (`-32009`) e `message/send`, `tasks/get` (nomes 0.3) não existem (`-32601`). Nenhum modelo 0.3 é usado.
+2. **Mensagem final no histórico.** O SDK só move `status.message` para `history` quando o *próximo* status a
+   substitui; uma mensagem enviada uma vez no estado final ficaria fora do histórico (e os exemplos `08`/`09` têm a
+   mensagem do agente em ambos). `_finish` publica a mesma `Message` (mesmo `messageId`) num `WORKING` e depois no estado
+   final: `history=[usuário, agente]`, `status.message=agente`. Custo: durante milissegundos `GetTask` pode ver `WORKING`
+   com o texto final. Na Fase 6 vale o mesmo para `INPUT_REQUIRED`.
+3. **Versão da política** no artifact vem do `Reserved.policy_version` (resource lido), sobrescrevendo o campo
+   `politica` que a tool devolveu. Teste com stub: resource `2031-05-17`, tool `outra` → artifact `2031-05-17`.
+4. **Ciclo de vida:** `create_app` só constrói; o `lifespan` faz `async with host`. O `McpHost` é de uso único
+   (o `httpx2.AsyncClient` não reabre), o que combina com um lifespan por processo. Um só cliente MCP atende todas as Tasks.
+5. **Trace sem estado compartilhado:** `traceparent` é lido do `ServerCallContext` de *cada* requisição e passado
+   por argumento até `McpHost`. O executor não guarda nada por Task. Mutante com variável global é detectado.
+6. **Falhas MCP** viram `FAILED` com texto fixo, sem URL, porta, token ou mensagem interna
+   (`indisponivel` / `codigo -32602` / `resposta inesperada`). O mesmo host se recupera quando o servidor volta.
+7. **Ponto de extensão da Fase 6:** `_conclude` e `_continue` (na Fase 5 um conflito virava `FAILED`). A ponte entra nesses dois
+   métodos; handlers, card e lifespan não mudam.
+8. **IDs:** `task-…`/`ctx-…`/`msg-…`/`art-…`, como nos exemplos, por `IDGenerator` do SDK.
+9. **Ruído do SDK:** com `break` antecipado em `on_message_send`, o a2a-sdk 1.3.0 deixa um gerador aberto que o GC fecha
+   fora do contexto: OpenTelemetry loga "Failed to detach context" e o asyncio loga `EventQueueSource._dispatch_loop`
+   abandonado. Medido: nenhuma tarefa sobrevive ao GC, respostas e Tasks corretas. `silence_known_sdk_noise()`
+   descarta só essas duas mensagens (o resto desses loggers passa).
+
+### Compatibilidade ProtoJSON (achados)
+
+- Card idêntico ao `exemplos/wire/07` exceto pelo host da URL (teste compara o JSON inteiro).
+- `SendMessage` devolve `result.task`. `GetTask` devolve a `Task` **direto** em `result` (o SDK 1.3.0 segue a especificação
+  v1.0; o exemplo `09` mostra `result.task`). O validador aceita as duas formas (`tarefa_de`). Mantido o do SDK.
+- Enums como string (`TASK_STATE_*`, `ROLE_*`), camelCase, `parts[].text`, `timestamp` RFC 3339.
+
+### Validador original contra os processos reais
+
+29/36: **21–26, 31, 35 passam** (alvo da fase) e 01–20 e 34. Falham 27–30, 32, 33 e 36, todos dependem de pausa
+(Fase 6). O 34 passa sem ter o que vazar ainda.
+
+### Pendências para a Fase 6 (resolvidas: ver a seção da Fase 6)
+
+1. Registro privado por `taskId` (`InputRequired` inteiro, trace inicial, política); nunca em Task/history/metadata/log.
+2. `_conclude`: `InputRequired` → `INPUT_REQUIRED` com `alternativas: a, b` na ordem do `enum`.
+3. `_continue`: aceitar só Task pausada, `escolha=<id>`/`recusar`, inválida sem chamar o MCP; segunda pausa possível.
+4. `Declined` → `CANCELED` sem artifact (hoje o ramo é defensivo).
+5. Continuação sem `traceparent` herda o da Task original.
+
+
+## Fase 6 — A ponte A2A ↔ MCP (MRTR)
+
+### Onde a ponte acontece
+
+- **Pausa:** `executor.py::_conclude`, ramo `InputRequired`. O `InputRequired` inteiro vai para o `PendingStore` (por
+  `taskId`), *depois* a Task é anunciada como `INPUT_REQUIRED` com `alternativas: a, b` (ordem do `enum`).
+- **Retomada:** `executor.py::_continue` → `McpHost.resume(entry.pause, answer, traceparent)`. É o único ponto em que o
+  `requestState` volta ao servidor, intacto, com a chave de `inputRequests`, os argumentos originais e id JSON-RPC novo
+  (o cliente MCP longevo da Fase 4 garante a unicidade).
+
+### Máquina de estados
+
+```
+(nova)  SUBMITTED ─► WORKING ─┬─► COMPLETED   reserva feita (artifact "reserva")
+                              ├─► FAILED      isError / indisponível / inesperado
+                              ├─► REJECTED    texto que não é o comando
+                              └─► INPUT_REQUIRED ◄─────────────────────────┐
+                                     │ escolha=<id do enum>   ► WORKING ─► COMPLETED | FAILED | INPUT_REQUIRED (2ª pausa)
+                                     │ escolha=recusar        ► WORKING ─► CANCELED (sem artifact)
+                                     └ qualquer outra coisa   ► INPUT_REQUIRED, mesma lista, MCP não é chamado ─┘
+```
+
+### Estado privado (`agente/pending.py`)
+
+`PendingStore`: `dict[taskId → PendingTask(pause: InputRequired, traceparent)]`, em memória, uma instância por
+`create_app`. Métodos síncronos (atômicos sob asyncio): `put`, `get`, `claim` (retira e devolve: só um chamador
+recebe), `discard`. `repr` nunca mostra estado (`InputRequired.request_state` tem `repr=False`). O agente não
+decodifica nem compara o `requestState`; só o guarda e o repete. As alternativas válidas são exclusivamente o `enum`
+recebido (`pause.choices`): nenhuma regra de sala no agente. Descarte: `claim` retira a entrada antes do retry, então
+ela some em COMPLETED/CANCELED/FAILED e é substituída numa segunda pausa.
+
+### Decisões
+
+1. **Mensagem de pausa enviada uma vez** (`_ask`). O SDK move `status.message` para o `history` quando a Task é
+   continuada; enviar a mensagem duas vezes (como `_finish` faz nos estados terminais) a duplicaria no histórico. Assim
+   o histórico final é `[pedido, alternativas, escolha, resultado]`, igual ao exemplo `10`. Durante a pausa o
+   `history` de `GetTask` tem só o pedido e a pergunta está em `status.message` (o exemplo `09` repete a pergunta no
+   histórico; mantive a semântica do SDK, e o validador lê `status.message`).
+2. **`contextId` da continuação.** A continuação traz só `taskId`; sem correção o SDK gera um `contextId` novo para a
+   mensagem e a Task passa a ter dois (achado ao testar: a 2ª requisição de uma Task falhava com "Context in event
+   doesn't match"). `TaskAwareContextBuilder` repassa o `contextId` guardado.
+3. **Duas continuações simultâneas da mesma Task.** Três camadas: (a) `OneAtATimePerTask` serializa as mensagens
+   do mesmo `taskId` (lock por Task, fraco): a segunda só é avaliada depois da primeira e recebe a recusa padrão do SDK
+   (`-32004`, Task terminal); sem isso o SDK a enfileirava e devolvia a Task concluída por outra resposta; (b)
+   o builder recusa Task `SUBMITTED/WORKING` (caso `returnImmediately`); (c) `claim` garante que só uma resposta
+   obtém a pausa. Medido: 3 e 8 respostas simultâneas geram exatamente 1 `tools/call` de retry.
+4. **Recusar uma continuação não pode matar a Task.** Uma exceção dentro do `execute` faz o SDK marcar a Task `FAILED`.
+   Por isso o caso "Task pausada sem entrada privada" é recusado no builder (antes do executor).
+5. **Trace da Task.** A entrada guarda o `traceparent` do pedido inicial. A continuação usa sempre esse; um
+   `traceparent` diferente na continuação não move a Task de trace; uma Task que começou sem trace adota o da
+   continuação. `McpHost` gera um span novo por requisição.
+6. **Falha MCP no retry** (servidor fora do ar, `-32602` por TTL do token expirado) encerra a Task em `FAILED` e
+   descarta a entrada. Não há retomada automática depois de uma queda: o usuário refaz o pedido (nada foi reservado).
+7. **Cancelamento:** texto fixo `Reserva cancelada: pedido recusado.`, sem artifact.
+8. **Logs:** a pilha de logs do SDK MCP registra, em DEBUG, cada requisição enviada, inclusive o `requestState` do retry.
+   `install_log_filters()` descarta essas linhas (`mcp.client.streamable_http` contendo `requestState`). Teste com
+   DEBUG ligado.
+9. **Testes que carregam `main`:** `agente/main.py` e `servidor-mcp/main.py` coexistem; os testes os carregam por caminho
+   (`tests/agent_app.py`, `tests/server_app.py`).
+
+### Limitações e riscos
+
+- O `PendingStore` é só memória: reiniciar o agente perde as pausas (a Task também, pois o `InMemoryTaskStore` é a
+  mesma vida). O `requestState` em si sobreviveria (servidor sem estado), mas o agente não o teria mais.
+- Pausas abandonadas ficam na memória até o fim do processo (não há expiração; o token do servidor expira em 600 s e o
+  retry tardio vira `FAILED`).
+- Uma queda do servidor MCP durante o retry cancela a oportunidade de escolher de novo (ver decisão 6).
+- `cancel` (CancelTask) continua não suportado; a skill não o anuncia.
